@@ -35,8 +35,21 @@ It is tested under Ubuntu Linux 20.04.3 LTS and Python 3.8.10 environment, and r
 * [PyTorch](https://pytorch.org/)
 * [numpy](http://www.numpy.org/)
 
+
 # Runing SPADE
 Download the model from this link [Backdoored Model](https://www.dropbox.com/scl/fi/19ukt2am3oqx7ujy1tn8j/checkpoint.pt.best?rlkey=0luonuu6oop1pp7za4c5izp6e&dl=0).
 After downloading, move the model to "data/checkpoint.pt.best".
 Execute SPADE by running the provided Jupyter Notebook.
 
+# Citation 
+Please cite our work if you use the codebase: 
+```
+@inproceedings{
+anonymous2024spade,
+title={{SPADE}: Sparsity-Guided Debugging for Deep Neural Networks},
+author={Arshia Soltani Moakhar*, Eugenia Iofinova*, Elias Frantar, Dan Alistarh},
+booktitle={Forty-first International Conference on Machine Learning},
+year={2024},
+url={https://openreview.net/forum?id=oBYv73nOoA}
+}
+```
