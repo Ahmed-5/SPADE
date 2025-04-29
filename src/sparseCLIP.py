@@ -1,351 +1,430 @@
 import math
 import time
-
 import torch
+from torch import Tensor
 import torch.nn as nn
+from torchvision._internally_replaced_utils import load_state_dict_from_url
+from typing import Type, Any, Callable, Union, List, Optional
 import transformers
 from clip import clip
 
-DEBUG = False 
+# ----------------------------------------
+# ResNetPrim Implementation
+# ----------------------------------------
+__all__ = ['ResNetPrim', 'resnet18_prim', 'resnet34_prim', 'resnet50_prim',
+           'resnet101_prim', 'resnet152_prim']
 
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+model_urls = {
+    'resnet18': 'https://download.pytorch.org/models/resnet18-f37072fd.pth',
+    # ... other URLs ...
+}
 
 
-class SparseCLIP:
-    def __init__(self, model):
-        """
-        Initialize SparseCLIP with a CLIP model
-        
-        Args:
-            model: A CLIP model (containing visual and text encoders)
-        """
-        self.model = model
-        self.dev = next(model.parameters()).device
-        self.prunable_layers = self._get_prunable_layers()
-        self.sparse_layers = {}
-        
-        # Initialize SparseGPT for each prunable layer
-        for name, layer in self.prunable_layers.items():
-            self.sparse_layers[name] = SparseGPT(layer)
-            
-    def _get_prunable_layers(self):
-        """
-        Get all prunable layers (Linear, Conv) from the CLIP model
-        
-        Returns:
-            Dict of prunable layers with their names
-        """
-        prunable_layers = {}
-        
-        # Handle visual encoder
-        for name, module in self.model.visual.named_modules():
-            if isinstance(module, (nn.Linear, nn.Conv2d)) and module.weight.requires_grad:
-                prunable_layers[f"visual.{name}"] = module
-                
-        # Handle text encoder
-        for name, module in self.model.transformer.named_modules():
-            if isinstance(module, (nn.Linear, transformers.Conv1D)) and module.weight.requires_grad:
-                prunable_layers[f"text.{name}"] = module
-                
-        return prunable_layers
-    
-    def add_batch(self, images, texts, blocksize=1024):
-        """
-        Process a batch through the model and collect statistics for pruning
-        
-        Args:
-            images: Batch of images
-            texts: Batch of text tokens
-            blocksize: Block size for processing
-        """
-        # Store original forward hooks to restore later
-        original_hooks = {}
-        hook_handles = []
-        layer_inputs = {}
-        layer_outputs = {}
-        
-        # Register forward hooks to capture inputs and outputs
-        def hook_fn(name):
-            def _hook(module, inp, out):
-                if isinstance(inp, tuple):
-                    inp = inp[0]
-                layer_inputs[name] = inp.detach()
-                layer_outputs[name] = out.detach()
-            return _hook
-        
-        for name, layer in self.prunable_layers.items():
-            handle = layer.register_forward_hook(hook_fn(name))
-            hook_handles.append(handle)
-            
-        # Forward pass
-        image_features = self.model.encode_image(images)
-        text_features = self.model.encode_text(texts)
-        
-        # Remove hooks
-        for handle in hook_handles:
-            handle.remove()
-            
-        # Add batch data to each sparse layer
-        for name, sparse_layer in self.sparse_layers.items():
-            if name in layer_inputs and name in layer_outputs:
-                sparse_layer.add_batch(layer_inputs[name], layer_outputs[name], blocksize)
-                
-    def prune(self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01):
-        """
-        Prune the CLIP model with the specified sparsity
-        
-        Args:
-            sparsity: Target sparsity level (0.0 to 1.0)
-            prunen, prunem: Advanced pruning parameters
-            blocksize: Block size for pruning
-            percdamp: Damping factor for numerical stability
-        """
-        print(f"Pruning CLIP model to {sparsity*100:.1f}% sparsity")
-        
-        # Prune each layer
-        for name, sparse_layer in self.sparse_layers.items():
-            print(f"Pruning layer: {name}")
-            sparse_layer.fasterprune(sparsity, prunen, prunem, blocksize, percdamp)
-            sparse_layer.free()  # Free memory
-            
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-        
-    def eval_model(self, eval_dataset, batch_size=32):
-        """
-        Evaluate the pruned CLIP model on a dataset
-        
-        Args:
-            eval_dataset: Dataset for evaluation
-            batch_size: Batch size for evaluation
-        
-        Returns:
-            Accuracy metrics
-        """
-        self.model.eval()
-        dataloader = torch.utils.data.DataLoader(eval_dataset, batch_size=batch_size)
-        
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for images, texts in dataloader:
-                images = images.to(self.dev)
-                texts = clip.tokenize(texts).to(self.dev)
-                
-                # Get features
-                image_features = self.model.encode_image(images)
-                text_features = self.model.encode_text(texts)
-                
-                # Normalize features
-                image_features = image_features / image_features.norm(dim=1, keepdim=True)
-                text_features = text_features / text_features.norm(dim=1, keepdim=True)
-                
-                # Calculate similarity
-                similarity = (100.0 * image_features @ text_features.T)
-                
-                # Get predictions
-                values, indices = similarity.topk(1)
-                
-                # Count correct predictions (diagonal matches)
-                for i in range(len(indices)):
-                    if indices[i] == i:
-                        correct += 1
-                total += len(indices)
-        
-        return correct / total
+def safe_inverse(H: torch.Tensor) -> torch.Tensor:
+    """
+    Safely compute H^{-1}: try Cholesky + inverse, fallback to pinv.
+    """
+    # 1) Symmetrize
+    H_sym = 0.5 * (H + H.transpose(-1, -2))
+    # 2) Try Cholesky
+    try:
+        L = torch.linalg.cholesky(H_sym)
+        return torch.cholesky_inverse(L)
+    except RuntimeError:
+        # 3) Fallback to pseudo-inverse
+        return torch.linalg.pinv(H_sym, hermitian=True)
 
+
+def conv3x3(in_planes: int, out_planes: int, stride: int = 1,
+            groups: int = 1, dilation: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=dilation, groups=groups, bias=False, dilation=dilation)
+
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+class BasicBlockPrim(nn.Module):
+    expansion: int = 1
+
+    def __init__(self, inplanes: int, planes: int, stride: int = 1,
+                 downsample: Optional[nn.Module] = None,
+                 groups: int = 1, base_width: int = 64,
+                 dilation: int = 1,
+                 norm_layer: Optional[Callable[..., nn.Module]] = None) -> None:
+        super().__init__()
+        norm_layer = norm_layer or nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError('BasicBlock only supports groups=1 and base_width=64')
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: Tensor, get_activations: bool=False):
+        identity = x
+        out1 = self.conv1(x)
+        out2 = self.bn1(out1)
+        out3 = self.relu(out2)
+        out4 = self.conv2(out3)
+        out5 = self.bn2(out4)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out6 = out5 + identity
+        out7 = self.relu(out6)
+        if get_activations:
+            return out7, {
+                'conv1': out1, 'bn1': out2, 'relu1': out3,
+                'conv2': out4, 'bn2': out5, 'plus': out6, 'relu2': out7
+            }
+        return out7
+
+class BottleneckPrim(nn.Module):
+    expansion: int = 4
+
+    def __init__(self, inplanes: int, planes: int, stride: int = 1,
+                 downsample: Optional[nn.Module] = None,
+                 groups: int = 1, base_width: int = 64,
+                 dilation: int = 1,
+                 norm_layer: Optional[Callable[..., nn.Module]] = None) -> None:
+        super().__init__()
+        norm_layer = norm_layer or nn.BatchNorm2d
+        width = int(planes * (base_width / 64.)) * groups
+        self.conv1 = conv1x1(inplanes, width)
+        self.bn1 = norm_layer(width)
+        self.conv2 = conv3x3(width, width, stride, groups, dilation)
+        self.bn2 = norm_layer(width)
+        self.conv3 = conv1x1(width, planes * self.expansion)
+        self.bn3 = norm_layer(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: Tensor, get_activations: bool=False):
+        identity = x
+        out1 = self.conv1(x)
+        out2 = self.bn1(out1)
+        out3 = self.relu(out2)
+        out4 = self.conv2(out3)
+        out5 = self.bn2(out4)
+        out6 = self.relu(out5)
+        out7 = self.conv3(out6)
+        out8 = self.bn3(out7)
+        if self.downsample is not None:
+            identity = self.downsample(x)
+        out9 = out8 + identity
+        out10 = self.relu(out9)
+        if get_activations:
+            return out10, {
+                'conv1': out1, 'bn1': out2, 'relu1': out3,
+                'conv2': out4, 'bn2': out5, 'relu2': out6,
+                'conv3': out7, 'bn3': out8, 'plus': out9, 'relu3': out10
+            }
+        return out10
+
+class ResNetPrim(nn.Module):
+    def __init__(self, block: Type[Union[BasicBlockPrim, BottleneckPrim]],
+                 layers: List[int], num_classes: int=1000,
+                 zero_init_residual: bool=False,
+                 groups: int=1, width_per_group: int=64,
+                 replace_stride_with_dilation: Optional[List[bool]]=None,
+                 norm_layer: Optional[Callable[..., nn.Module]]=None) -> None:
+        super().__init__()
+        norm_layer = norm_layer or nn.BatchNorm2d
+        self.inplanes = 64
+        self.dilation = 1
+        if replace_stride_with_dilation is None:
+            replace_stride_with_dilation = [False, False, False]
+        self.groups = groups
+        self.base_width = width_per_group
+        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7,
+                               stride=2, padding=3, bias=False)
+        self.bn1 = norm_layer(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
+                                       dilate=replace_stride_with_dilation[0])
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
+                                       dilate=replace_stride_with_dilation[1])
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
+                                       dilate=replace_stride_with_dilation[2])
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        # Initialization
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, BottleneckPrim):
+                    nn.init.constant_(m.bn3.weight, 0)
+                elif isinstance(m, BasicBlockPrim):
+                    nn.init.constant_(m.bn2.weight, 0)
+
+    def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+        norm_layer = nn.BatchNorm2d
+        downsample = None
+        previous_dilation = self.dilation
+        if dilate:
+            self.dilation *= stride
+            stride = 1
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride),
+                norm_layer(planes * block.expansion),
+            )
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample,
+                            self.groups, self.base_width, previous_dilation, norm_layer))
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self.inplanes, planes,
+                                groups=self.groups,
+                                base_width=self.base_width,
+                                dilation=self.dilation,
+                                norm_layer=norm_layer))
+        return nn.Sequential(*layers)
+
+# Factory for ResNetPrim backbones
+def resnet50_prim(pretrained: bool=False, **kwargs) -> ResNetPrim:
+    model = ResNetPrim(BottleneckPrim, [3, 4, 6, 3], **kwargs)
+    if pretrained:
+        state = load_state_dict_from_url(model_urls['resnet50'], progress=True)
+        model.load_state_dict(state)
+    return model
+
+# ----------------------------------------
+# SparseCLIP Implementation
+# ----------------------------------------
 
 class SparseGPT:
     def __init__(self, layer):
         self.layer = layer
-        self.dev = self.layer.weight.device
+        self.dev = layer.weight.device
         W = layer.weight.data.clone()
-        if isinstance(self.layer, nn.Conv2d):
+        if isinstance(layer, nn.Conv2d):
             W = W.flatten(1)
-            
-        if isinstance(self.layer, transformers.Conv1D):
+        if isinstance(layer, transformers.Conv1D):
             W = W.t()
-            
-        self.rows = W.shape[0]
-        self.columns = W.shape[1]
+        self.rows, self.columns = W.shape
         self.nsamples = 0
+        self.H = torch.zeros((self.columns, self.columns), device=self.dev)
 
-        if isinstance(self.layer, nn.Conv2d) and self.layer.groups > 1:
-            self.H = torch.zeros((W.shape[0], self.columns, self.columns), device=self.dev)
-        else:
-            self.H = torch.zeros((self.columns, self.columns), device=self.dev)
-            
-    def add_batch(self, inp, out, blocksize=1024):
-        if DEBUG:
-            self.inp1 = inp
-            self.out1 = out
-        if len(inp.shape) == 2:
-            inp = inp.unsqueeze(0)
-        tmp = inp.shape[0]
-        if isinstance(self.layer, nn.Linear) or isinstance(self.layer, transformers.Conv1D):
-            if len(inp.shape) >= 3:
-                inp = inp.reshape((-1, inp.shape[-1]))
-            inp = inp.t()
-            
+    def add_batch(self, inp: Tensor, out: Tensor, blocksize: int = 1024):
         if isinstance(self.layer, nn.Conv2d):
             unfold = nn.Unfold(
-                    self.layer.kernel_size,
-                    dilation=self.layer.dilation,
-                    padding=self.layer.padding,
-                    stride=self.layer.stride
-                )
-            channels=inp.shape[1]
-            inp = unfold(inp)
-            
-            if self.layer.groups == 1:
-                inp = inp.permute([1, 0, 2])
-                inp = inp.flatten(1)
-            else:
-                inp = inp.reshape((inp.shape[0], channels, inp.shape[1]//channels, inp.shape[2]))
-                inp = inp.permute([2, 0, 1, 3])
+                kernel_size=self.layer.kernel_size,
+                dilation=self.layer.dilation,
+                padding=self.layer.padding,
+                stride=self.layer.stride
+            )
+            patches = unfold(inp)
+            inp_flat = patches.permute(1, 0, 2).reshape(self.columns, -1)
+        else:
+            inp2 = inp.reshape(-1, inp.shape[-1]) if inp.dim() > 2 else inp
+            inp_flat = inp2.t()
+        n_new = inp_flat.shape[1]
+        self.H *= (self.nsamples / (self.nsamples + n_new))
+        self.nsamples += n_new
+        scaled = math.sqrt(2.0 / self.nsamples) * inp_flat.float()
+        self.H += scaled.matmul(scaled.t())
 
-        if isinstance(self.layer, nn.Conv2d) and self.layer.groups > 1:
-            inp = inp.flatten(2)
-            
-        self.H *= self.nsamples / (self.nsamples + tmp)
-        self.nsamples += tmp
-        inp = math.sqrt(2 / self.nsamples) * inp.float()
-        self.H += inp.matmul(inp.t())
-        
-    def fasterprune(
-        self, sparsity, prunen=0, prunem=0, blocksize=128, percdamp=.01
-    ):
-        W = self.layer.weight.data.clone()
-        if isinstance(self.layer, nn.Conv2d):
-            W = W.flatten(1)
+    def fasterprune(self, sparsity, percdamp=1e-2): # Removed unused blocksize
+        W = self.layer.weight.data.clone().float()
+        if isinstance(self.layer, nn.Conv2d): W = W.flatten(1)
+        # Remove Conv1D check if not needed for your CLIP models
+        if isinstance(self.layer, transformers.Conv1D): W = W.t()
+
+        # Damped Hessian (H = H + lambda * diag(H) * I) - Check if this damping is optimal
+        H_damped = self.H + percdamp * torch.mean(torch.diagonal(self.H)) * torch.eye(self.columns, device=self.dev)
+
+        # Inverse via safe method
+        Hinv = safe_inverse(H_damped)
+
+        # --- CRITICAL CHANGE: Corrected Score Calculation ---
+        # Using OBS-like criterion: Error increase approx W^2 / (2 * diag(H^-1))
+        # We ignore the factor of 2 as it doesn't affect ranking
+        Hinv_diag = torch.diagonal(Hinv)
+        epsilon = 1e-9 # For numerical stability
+        score = W.pow(2) / (Hinv_diag.unsqueeze(0) + epsilon)
+        # ----------------------------------------------------
+
+        # Ensure score shape matches W shape if needed (might depend on W manipulations)
+        if score.shape != W.shape:
+            # This might happen if W was transposed, ensure score aligns
+            # Example: if W is (rows, columns), score might need broadcasting or alignment
+            # Needs careful checking based on layer type and W manipulation
+            print(f"Warning: Score shape {score.shape} mismatch with W shape {W.shape} in layer {type(self.layer)}")
+            # Adjust score shape if necessary, e.g., ensure it's (rows, columns) matching W
+            # This depends heavily on how W was flattened/transposed earlier.
+            # Assuming score calculation yields (1, columns), needs broadcasting to W's rows.
+            # If W is (rows, columns), Hinv_diag is (columns), score becomes (rows, columns) via broadcasting. This should be okay.
+
+        # Magnitude-based mask using the corrected score
+        # Keep weights with scores *below* the threshold (low error impact)
+        thresh = torch.quantile(score.flatten(), sparsity) # Flatten score to compute quantile correctly
+        mask = score > thresh # Keep weights with score > threshold (higher importance relative to error increase)
+                            # Or use 'score <= thresh' to prune low-impact weights (more common for OBS)
+                            # Let's stick to pruning low-impact weights:
+        mask = score <= thresh
+
+        # Apply mask
+        W_pruned = W * (~mask) # Apply inverse mask to keep important weights
+
+        # Reshape back (ensure Wp assignment handles Conv1D transpose correctly)
         if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
-        W = W.float()
+            Wp = W_pruned.t()
+        else:
+            Wp = W_pruned
 
-        tick = time.time()
+        self.layer.weight.data.copy_(Wp.reshape(self.layer.weight.shape))
 
-        H = self.H
+        # Free memory
         del self.H
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
+        del H_damped
+        del Hinv
+        torch.cuda.empty_cache() # Good practice
 
-        Losses = torch.zeros(self.rows, device=self.dev)
+class SparseCLIP:
+    """
+    Integrates SparseGPT pruning into CLIP with support for ResNetPrim backbones.
+    """
+    def __init__(self, model, visual_backbone: str='default'):
+        self.model = model
+        self.dev = next(model.parameters()).device
+        self.prunable_layers = {}
+        self.sparse_layers = {}
+        # Collect layers from visual encoder
+        if visual_backbone == 'resnetprim':
+            visual = self.model.visual
+        else:
+            visual = self.model.visual
+        for name, module in visual.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)) and module.weight.requires_grad:
+                self.prunable_layers[f"visual.{name}"] = module
+        # Collect from text encoder
+        for name, module in self.model.transformer.named_modules():
+            if isinstance(module, (nn.Linear, transformers.Conv1D)) and module.weight.requires_grad:
+                self.prunable_layers[f"text.{name}"] = module
+        # Init SparseGPT
+        for name, layer in self.prunable_layers.items():
+            self.sparse_layers[name] = SparseGPT(layer)
 
-        damp = percdamp * torch.mean(torch.diag(H))
-        diag = torch.arange(self.columns, device=self.dev)
-        H[diag, diag] += damp
-        H = torch.linalg.cholesky(H)
-        H = torch.cholesky_inverse(H)
-        H = torch.linalg.cholesky(H, upper=True)
-        Hinv = H
+    def add_batch(self, images, texts):
+        hooks = []
+        inputs, outputs = {}, {}
+        def hook_fn(key):
+            def fn(mod, inp, out):
+                inputs[key] = inp[0] if isinstance(inp, tuple) else inp
+                outputs[key] = out
+            return fn
+        for name, layer in self.prunable_layers.items():
+            hooks.append(layer.register_forward_hook(hook_fn(name)))
+        # forward
+        _ = self.model.encode_image(images)
+        _ = self.model.encode_text(texts)
+        # remove hooks
+        for h in hooks: h.remove()
+        # collect
+        for name, s in self.sparse_layers.items():
+            if name in inputs and name in outputs:
+                s.add_batch(inputs[name].detach(), outputs[name].detach())
 
-        mask = None
-
-        for i1 in range(0, self.columns, blocksize):
-            i2 = min(i1 + blocksize, self.columns)
-            count = i2 - i1
-
-            W1 = W[:, i1:i2].clone()
-            Q1 = torch.zeros_like(W1)
-            Err1 = torch.zeros_like(W1)
-            Losses1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
-
-            if prunen == 0: 
-                if mask is not None:
-                    mask1 = mask[:, i1:i2]
-                else:
-                    tmp = W1 ** 2 / (torch.diag(Hinv1).reshape((1, -1))) ** 2
-                    thresh = torch.sort(tmp.flatten())[0][int(tmp.numel() * sparsity)]
-                    mask1 = tmp <= thresh
-            else:
-                mask1 = torch.zeros_like(W1) == 1
-
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
-
-                if prunen != 0 and i % prunem == 0:
-                    tmp = W1[:, i:(i + prunem)] ** 2 / (torch.diag(Hinv1)[i:(i + prunem)].reshape((1, -1))) ** 2
-                    mask1.scatter_(1, i + torch.topk(tmp, prunen, dim=1, largest=False)[1], True)
-
-                q = w.clone()
-                q[mask1[:, i]] = 0
-
-                Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d ** 2
-
-                err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                Err1[:, i] = err1
-
-            W[:, i1:i2] = Q1
-            Losses += torch.sum(Losses1, 1) / 2
-
-            W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-
-            if DEBUG:
-                self.layer.weight.data[:, :i2] = W[:, :i2]
-                self.layer.weight.data[:, i2:] = W[:, i2:]
-                print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-                print(torch.sum(Losses))
-
-        print('time %.2f' % (time.time() - tick))
-        print('error', torch.sum(Losses).item())
-
-        if isinstance(self.layer, transformers.Conv1D):
-            W = W.t()
-        self.layer.weight.data = W.reshape(self.layer.weight.shape).to(self.layer.weight.data.dtype)
-        if DEBUG:
-            print(torch.sum((self.layer(self.inp1) - self.out1) ** 2))
-
-    def free(self):
-        if DEBUG:
-            self.inp1 = None
-            self.out1 = None
-        self.H = None
+    def prune(self, sparsity: float):
+        for name, s in self.sparse_layers.items():
+            print(f"Pruning layer: {name}")
+            s.fasterprune(sparsity)
         torch.cuda.empty_cache()
 
+    def eval(self, dataset, batch_size=32):
+        self.model.eval()
+        loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
+        correct, total = 0, 0
+        with torch.no_grad():
+            for imgs, txts in loader:
+                imgs, txts = imgs.to(self.dev), clip.tokenize(txts).to(self.dev)
+                imf = self.model.encode_image(imgs)
+                tf  = self.model.encode_text(txts)
+                imf = imf / imf.norm(dim=1, keepdim=True)
+                tf  = tf / tf.norm(dim=1, keepdim=True)
+                sims = (100*imf @ tf.t())
+                vals, inds = sims.topk(1)
+                correct += sum(int(i==j) for i,j in zip(inds.flatten(), range(len(inds))))
+                total += len(inds)
+        return correct/total
 
-# Example usage
-def apply_sparseclip(model_name="ViT-B/32", dataset=None, sparsity=0.5):
-    """
-    Apply SparseCLIP to a CLIP model
-    
-    Args:
-        model_name: CLIP model name
-        dataset: Dataset for calibration and evaluation
-        sparsity: Target sparsity level (0.0 to 1.0)
-        
-    Returns:
-        Pruned CLIP model
-    """
-    # Load model
+# Helper to load and apply
+
+def apply_sparseclip(model_name: str="ViT-B/32", dataset=None, sparsity: float=0.5):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # --- CRITICAL CHANGE: Load Model Correctly ---
+    # Load the desired CLIP model directly.
+    # If using ResNet, use "RN50", "RN101", etc.
+    print(f"Loading CLIP model: {model_name}")
     model, preprocess = clip.load(model_name, device=device)
-    
-    # Create SparseCLIP instance
-    sparse_clip = SparseCLIP(model)
-    
-    # If dataset is provided
-    if dataset is not None:
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=32)
-        
-        # Collect statistics from calibration data
-        print("Collecting statistics for pruning...")
-        for images, texts in dataloader:
-            images = images.to(device)
-            texts = clip.tokenize(texts).to(device)
-            sparse_clip.add_batch(images, texts)
-            
-        # Prune the model
-        sparse_clip.prune(sparsity)
-        
-        # Evaluate the pruned model
-        accuracy = sparse_clip.eval_model(dataset)
-        print(f"Pruned model accuracy: {accuracy:.4f}")
-    
-    return model
+
+    # Remove the ResNetPrim swapping logic unless you have a specific,
+    # well-justified reason and implement weight loading correctly (Option B above).
+    # --------------------------------------------
+
+    if dataset is None:
+        print("Warning: No calibration dataset provided. Pruning will not be performed.")
+        return model, preprocess # Return original model if no dataset
+
+    print("Initializing SparseCLIP...")
+    # Pass 'default' or remove backbone argument if ResNetPrim isn't used
+    sparse = SparseCLIP(model)
+
+    print("Starting calibration (calculating Hessians)...")
+    # Consider using a subset of the dataset for calibration if it's large
+    # Also consider a larger batch size if memory allows
+    calibration_loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True) # Shuffle for better Hessian estimate
+    num_batches_for_calibration = min(100, len(calibration_loader)) # Limit calibration steps? Example: use 100 batches
+
+    count = 0
+    start_time = time.time()
+    for imgs, txts in calibration_loader:
+        # Ensure preprocessing is applied if the dataset doesn't provide tensors directly
+        # Assuming dataset yields PIL images and strings:
+        # processed_imgs = torch.stack([preprocess(img) for img in imgs]).to(device)
+        # tokenized_txts = clip.tokenize(list(txts)).to(device)
+
+        # If dataset already provides tensors:
+        processed_imgs = imgs.to(device)
+        # Assuming txts are strings that need tokenizing
+        if isinstance(txts, (list, tuple)) and isinstance(txts[0], str):
+             tokenized_txts = clip.tokenize(txts).to(device)
+        else: # Assume txts are already tokenized tensors
+             tokenized_txts = txts.to(device)
+
+
+        sparse.add_batch(processed_imgs, tokenized_txts)
+        count += 1
+        if count >= num_batches_for_calibration:
+             print(f"Completed calibration using {count} batches.")
+             break
+    print(f"Calibration finished in {time.time() - start_time:.2f} seconds.")
+
+
+    print(f"Pruning model with sparsity: {sparsity}")
+    start_time = time.time()
+    sparse.prune(sparsity)
+    print(f"Pruning finished in {time.time() - start_time:.2f} seconds.")
+
+
+    print("Evaluating pruned model...")
+    # Ensure evaluation uses the correct preprocessor and tokenization
+    # The eval function might need adjustment depending on the dataset format
+    acc = sparse.eval(dataset) # Pass the *original* dataset instance
+    print(f"Accuracy after pruning: {acc:.4f}")
+
+    return model, preprocess # Return the pruned model
